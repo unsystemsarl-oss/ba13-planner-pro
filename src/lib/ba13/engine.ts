@@ -1,188 +1,222 @@
-import type {
-  Assumptions,
-  CalcResult,
-  CloisonInput,
-  MaterialLine,
-  PriceMap,
-  ProjectType,
-} from "./types";
-import { TVA_RATE } from "./defaults";
+import type { CalcWarning, ModuleResult, ProjectModule, QuantityLine } from "@/lib/modules/types";
+import { DEFAULT_CATALOG, type CatalogItem } from "./catalog";
+import { computeGeometry } from "./geometry";
+import { findLimit } from "./systems";
+import type { Ba13Config, CloisonInput } from "./types";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+export const TVA_RATE = 0.2;
 
-/** Nombre de parements (faces recouvertes de plaques) selon le type d'ouvrage. */
-export function facesFor(type: ProjectType): number {
-  return type === "doublage" ? 1 : 2;
-}
+export function computeBa13(input: CloisonInput, config: Ba13Config): ModuleResult | null {
+  if (!["cloison_simple", "cloison_double", "doublage"].includes(input.projectType)) return null;
 
-/** Nombre de couches de plaques par face, forcé à 2 pour la cloison double parement. */
-export function layersFor(type: ProjectType, layers: 1 | 2): number {
-  if (type === "cloison_double") return 2;
-  return layers;
-}
+  const sys = config.system;
+  const c = sys.consumption;
+  const g = computeGeometry(input);
+  const waste = 1 + Math.max(0, input.wastePercent) / 100;
+  const warnings: CalcWarning[] = [];
+  const lines: QuantityLine[] = [];
 
-export interface Calculator {
-  id: ProjectType;
-  compute: (input: CloisonInput, a: Assumptions) => CalcResult;
-}
+  // ---------- Contrôles de cohérence ----------
+  if (g.openingArea > g.grossArea) {
+    warnings.push({
+      level: "warning",
+      message: "La surface des ouvertures dépasse la surface brute de l'ouvrage.",
+      source: "Contrôle géométrique",
+    });
+  }
+  if (input.height > sys.boardLength) {
+    warnings.push({
+      level: "info",
+      message: `Hauteur (${input.height} m) supérieure à la longueur de plaque (${sys.boardLength} m) : joints horizontaux à prévoir, non comptés séparément.`,
+      source: "Contrôle géométrique",
+    });
+  }
 
-function computeCloison(input: CloisonInput, a: Assumptions): CalcResult {
-  const warnings: string[] = [];
-  const { length: L, height: H, studSpacing, wastePercent } = input;
-  const spacing = studSpacing / 100;
-  const waste = 1 + wastePercent / 100;
+  const limit = findLimit(sys, input.profile, input.studSpacing, input.layersPerSide);
+  if (limit) {
+    if (input.height > limit.maxHeight) {
+      warnings.push({
+        level: "limit",
+        message: `Hauteur ${input.height} m supérieure à la limite paramétrée de ${limit.maxHeight} m pour ${input.profile} · entraxe ${input.studSpacing} cm · ${input.layersPerSide} couche(s). Réduisez l'entraxe, changez de profilé ou vérifiez le système retenu.`,
+        source: limit.verified
+          ? `${sys.manufacturer} — documentation technique`
+          : `${sys.manufacturer} — limite non vérifiée, hypothèse modifiable`,
+      });
+    } else if (!limit.verified) {
+      warnings.push({
+        level: "info",
+        message: `Limite de hauteur retenue : ${limit.maxHeight} m (valeur de saisie non vérifiée sur la documentation ${sys.manufacturer}).`,
+        source: "Hypothèse modifiable",
+      });
+    }
+  } else {
+    warnings.push({
+      level: "info",
+      message: "Aucune limite d'emploi renseignée pour cette combinaison profilé / entraxe / couches.",
+      source: "Hypothèse manquante",
+    });
+  }
 
-  const grossArea = L * H;
-  const openingArea = input.openings.reduce(
-    (s, o) => s + o.width * o.height * Math.max(0, o.quantity),
-    0,
-  );
-  const netArea = Math.max(0, grossArea - openingArea);
-  if (openingArea > grossArea) warnings.push("La surface des ouvertures dépasse la surface brute.");
-  if (H > a.boardLength)
-    warnings.push(
-      `Hauteur (${H} m) supérieure à la longueur de plaque (${a.boardLength} m) : joints horizontaux à prévoir.`,
-    );
+  if (g.openingCount > 0) {
+    warnings.push({
+      level: "warning",
+      message: `${g.openingCount} ouverture(s) déduite(s) de la surface de parement (${round2(g.openingArea)} m²). Les renforts de linteaux et de jambages (≈ ${round2(g.openingLintelMl)} ml de linteaux et ${round2(g.openingJambMl)} ml de jambages) ne sont pas encore quantifiés : à ajouter manuellement selon le système retenu.`,
+      source: "Limite connue du moteur",
+    });
+  }
 
-  const faces = facesFor(input.projectType);
-  const layers = layersFor(input.projectType, input.layersPerSide);
-  const boardArea = netArea * faces * layers;
-
-  const lines: MaterialLine[] = [];
-
-  // Plaques
-  const boardUnit = a.boardWidth * a.boardLength;
-  const boardsQty = (boardArea * waste) / boardUnit;
+  // ---------- Plaques ----------
+  const boardUnit = sys.boardWidth * sys.boardLength;
+  const boards = boardUnit > 0 ? (g.boardArea * waste) / boardUnit : 0;
   lines.push({
     key: "plaque",
-    label: `Plaque de plâtre BA13 (${a.boardWidth}×${a.boardLength} m)`,
-    unit: "plaque",
-    quantity: round2(boardsQty),
-    purchase: Math.ceil(boardsQty),
-    note: `${round2(boardArea * waste)} m² de parement (${faces} face(s) × ${layers} couche(s))`,
+    label: `Plaque de plâtre BA13 (${sys.boardWidth}×${sys.boardLength} m)`,
+    baseUnit: "u",
+    baseQuantity: round2(boards),
+    note: `${round2(g.boardArea * waste)} m² de parement — ${g.faces} face(s) × ${g.layers} couche(s), chute ${input.wastePercent} %`,
   });
 
-  // Rails : haut + bas (doublage : idem, 1 ossature)
-  const railMl = L * 2 * waste;
+  // ---------- Rails : calepinage réel des barres ----------
+  const barsPerRun = input.length > 0 ? Math.ceil(input.length / sys.profileLength) : 0;
+  const railMl = g.railRuns * barsPerRun * sys.profileLength;
   lines.push({
     key: "rail",
-    label: `Rail ${input.profile.split("/")[1]} (${a.profileLength} m)`,
-    unit: "barre",
-    quantity: round2(railMl / a.profileLength),
-    purchase: Math.ceil(railMl / a.profileLength),
-    note: `${round2(railMl)} ml (haut + bas)`,
+    label: `Rail ${input.profile.split("/")[1]}`,
+    baseUnit: "ml",
+    baseQuantity: round2(railMl),
+    note: `${g.railRuns} files de ${round2(g.railRunMl)} ml — ${barsPerRun} barre(s) de ${sys.profileLength} m par file`,
   });
 
-  // Montants
-  const studCount = Math.floor(L / spacing) + 1;
-  const studMl = studCount * H * waste;
+  // ---------- Montants : calepinage réel ----------
+  const barsPerStud = input.height > 0 ? Math.ceil(input.height / sys.profileLength) : 0;
+  const studMl = g.studCount * barsPerStud * sys.profileLength;
   lines.push({
     key: "montant",
-    label: `Montant ${input.profile.split("/")[0]} (${a.profileLength} m)`,
-    unit: "barre",
-    quantity: round2(studMl / a.profileLength),
-    purchase: Math.ceil(studMl / a.profileLength),
-    note: `${studCount} montants à ${studSpacing} cm d'entraxe`,
+    label: `Montant ${input.profile.split("/")[0]}`,
+    baseUnit: "ml",
+    baseQuantity: round2(studMl),
+    note: `${g.studCount} montants à ${input.studSpacing} cm d'entraxe × ${barsPerStud} barre(s) de ${sys.profileLength} m`,
   });
 
-  // Vis à plaques : périmètre + appuis intermédiaires
-  const screwsPerBoardM2 = (1 / spacing) * (1 / a.screwSpacing) + a.screwsPerM2Extra;
-  const screws = boardArea * waste * screwsPerBoardM2;
+  // ---------- Vis à plaques ----------
+  const fieldScrews = (1 / (input.studSpacing / 100)) * (1 / c.screwSpacingField);
+  const edgePerimeterPerM2 = (2 * (sys.boardWidth + sys.boardLength)) / boardUnit;
+  const edgeScrews = (edgePerimeterPerM2 / c.screwSpacingEdge) * 0.5; // rives partagées entre plaques
+  const screwsPerM2 = fieldScrews + edgeScrews + c.screwsPerM2Extra;
+  const screws = g.boardArea * waste * screwsPerM2;
   lines.push({
     key: "vis_plaque",
-    label: "Vis à plaques (boîte de 1000)",
-    unit: "boîte",
-    quantity: round2(screws / 1000),
-    purchase: Math.ceil(screws / 1000),
-    note: `≈ ${Math.ceil(screws)} vis (entraxe ${a.screwSpacing * 100} cm)`,
+    label: "Vis à plaques",
+    baseUnit: "u",
+    baseQuantity: Math.ceil(screws),
+    note: `≈ ${round2(screwsPerM2)} vis/m² (rives ${c.screwSpacingEdge * 100} cm, courant ${c.screwSpacingField * 100} cm)`,
   });
 
-  // Vis métal ossature
-  const metalScrews = studCount * 4 * waste;
+  // ---------- Fixations d'ossature ----------
+  const metalScrews = Math.ceil(g.studCount * c.metalFixingsPerStud);
   lines.push({
     key: "vis_metal",
-    label: "Vis métal / pinces d'assemblage (boîte de 500)",
-    unit: "boîte",
-    quantity: round2(metalScrews / 500),
-    purchase: Math.ceil(metalScrews / 500),
-    note: `≈ ${Math.ceil(metalScrews)} fixations d'ossature`,
+    label: "Vis métal / pinces d'assemblage",
+    baseUnit: "u",
+    baseQuantity: metalScrews,
+    note: `${c.metalFixingsPerStud} fixation(s) par montant`,
   });
 
-  // Chevilles de fixation des rails
-  const fixings = Math.ceil((L * 2) / a.railFixingSpacing) + 2;
+  // ---------- Chevilles de fixation des rails (implantation réelle) ----------
+  const fixingsPerRun =
+    input.length > 0 ? Math.floor(input.length / c.railFixingSpacing) + 1 : 0;
+  const fixings = fixingsPerRun * g.railRuns;
   lines.push({
     key: "cheville",
     label: "Chevilles + vis de fixation des rails",
-    unit: "u",
-    quantity: fixings,
-    purchase: fixings,
-    note: `Entraxe max ${a.railFixingSpacing * 100} cm`,
+    baseUnit: "u",
+    baseQuantity: fixings,
+    note: `${fixingsPerRun} points par file × ${g.railRuns} files — entraxe max ${c.railFixingSpacing * 100} cm`,
   });
 
-  // Bande à joint
-  const tapeMl = boardArea * a.tapeMlPerM2 * waste;
+  // ---------- Traitement des joints ----------
+  const tapeMl = g.boardArea * c.tapeMlPerM2 * waste;
   lines.push({
     key: "bande",
-    label: "Bande à joint (rouleau 150 ml)",
-    unit: "rouleau",
-    quantity: round2(tapeMl / 150),
-    purchase: Math.ceil(tapeMl / 150),
-    note: `≈ ${Math.ceil(tapeMl)} ml`,
+    label: "Bande à joint",
+    baseUnit: "ml",
+    baseQuantity: round2(tapeMl),
+    note: `${c.tapeMlPerM2} ml/m² de parement`,
   });
 
-  // Enduit
-  const compoundKg = boardArea * a.compoundKgPerM2 * waste;
+  const compoundKg = g.boardArea * c.compoundKgPerM2 * waste;
   lines.push({
     key: "enduit",
-    label: "Enduit à joint (sac 25 kg)",
-    unit: "sac",
-    quantity: round2(compoundKg / 25),
-    purchase: Math.ceil(compoundKg / 25),
-    note: `≈ ${Math.ceil(compoundKg)} kg`,
+    label: "Enduit à joint",
+    baseUnit: "kg",
+    baseQuantity: round2(compoundKg),
+    note: `${c.compoundKgPerM2} kg/m² de parement`,
   });
 
-  // Isolant
+  // ---------- Isolation ----------
   if (input.insulation) {
-    const insulM2 = netArea * a.insulationOverlap * waste;
+    const insulM2 = g.netArea * c.insulationOverlap * waste;
     lines.push({
       key: "isolant",
       label: "Isolant (laine minérale)",
-      unit: "m²",
-      quantity: round2(insulM2),
-      purchase: Math.ceil(insulM2),
-      note: `Recouvrement ×${a.insulationOverlap}`,
+      baseUnit: "m²",
+      baseQuantity: round2(insulM2),
+      note: `Recouvrement ×${c.insulationOverlap}`,
     });
   }
 
   return {
-    grossArea: round2(grossArea),
-    openingArea: round2(openingArea),
-    netArea: round2(netArea),
-    boardArea: round2(boardArea),
+    metrics: [
+      { label: "Surface brute", value: `${round2(g.grossArea)} m²` },
+      { label: "Ouvertures", value: `${round2(g.openingArea)} m²` },
+      { label: "Surface nette", value: `${round2(g.netArea)} m²` },
+      { label: "Parement total", value: `${round2(g.boardArea)} m²`, accent: true },
+    ],
     lines,
     warnings,
   };
 }
 
-/** Registre modulaire : ajouter ici les futurs types d'ouvrage (faux plafond, etc.). */
-export const CALCULATORS: Partial<Record<ProjectType, Calculator>> = {
-  cloison_simple: { id: "cloison_simple", compute: computeCloison },
-  cloison_double: { id: "cloison_double", compute: computeCloison },
-  doublage: { id: "doublage", compute: computeCloison },
+export const ba13Module: ProjectModule<CloisonInput, Ba13Config> = {
+  id: "ba13",
+  label: "BA13 — plaques de plâtre",
+  available: true,
+  defaultCatalog: DEFAULT_CATALOG,
+  compute: computeBa13,
 };
 
-export function calculate(input: CloisonInput, a: Assumptions): CalcResult | null {
-  const calc = CALCULATORS[input.projectType];
-  if (!calc) return null;
-  return calc.compute(input, a);
+export const MODULES = [
+  ba13Module,
+  { id: "mdf" as const, label: "MDF — panneaux bois", available: false },
+  { id: "aluminium" as const, label: "Aluminium — profilés", available: false },
+];
+
+export interface CostRow extends QuantityLine {
+  item: CatalogItem;
+  packages: number;
+  unitPrice: number;
+  total: number;
 }
 
-export function costing(lines: MaterialLine[], prices: PriceMap) {
-  const rows = lines.map((l) => ({
-    ...l,
-    unitPrice: prices[l.key] ?? 0,
-    total: round2(l.purchase * (prices[l.key] ?? 0)),
-  }));
+export function costing(lines: QuantityLine[], catalog: CatalogItem[]) {
+  const rows: CostRow[] = lines.map((l) => {
+    const item =
+      catalog.find((i) => i.key === l.key) ??
+      ({
+        key: l.key,
+        label: l.label,
+        category: "plaque",
+        baseUnit: l.baseUnit,
+        packageSize: 1,
+        packageUnit: "u",
+        price: 0,
+        supplier: "",
+      } as CatalogItem);
+    const size = item.packageSize > 0 ? item.packageSize : 1;
+    const packages = Math.ceil(l.baseQuantity / size);
+    return { ...l, item, packages, unitPrice: item.price, total: round2(packages * item.price) };
+  });
   const ht = round2(rows.reduce((s, r) => s + r.total, 0));
   const tva = round2(ht * TVA_RATE);
   return { rows, ht, tva, ttc: round2(ht + tva) };

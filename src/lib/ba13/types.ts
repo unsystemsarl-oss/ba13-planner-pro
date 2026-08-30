@@ -1,3 +1,5 @@
+import type { SystemProfile } from "./systems";
+
 export type ProjectType = "cloison_simple" | "cloison_double" | "faux_plafond" | "doublage";
 
 export type StudSpacing = 40 | 60;
@@ -9,20 +11,6 @@ export interface Opening {
   width: number; // m
   height: number; // m
   quantity: number;
-}
-
-/** Hypothèses de calcul entièrement paramétrables (aucune valeur figée). */
-export interface Assumptions {
-  boardWidth: number; // m
-  boardLength: number; // m
-  profileLength: number; // m — longueur commerciale des profilés
-  railFixingSpacing: number; // m — entraxe max des fixations de rails
-  screwSpacing: number; // m — entraxe des vis
-  screwsPerM2Extra: number; // vis supplémentaires / m² (marge)
-  tapeMlPerM2: number; // ml de bande / m² de plaque
-  compoundKgPerM2: number; // kg d'enduit / m² de plaque
-  insulationOverlap: number; // coefficient de recouvrement isolant
-  boardsPerBox: number; // non utilisé pour l'achat, indicatif
 }
 
 export interface CloisonInput {
@@ -37,22 +25,25 @@ export interface CloisonInput {
   wastePercent: number;
 }
 
-export interface MaterialLine {
-  key: string;
-  label: string;
-  unit: string;
-  quantity: number; // quantité calculée (avec chute)
-  purchase: number; // quantité d'achat arrondie
-  note?: string;
+/** Configuration système : profil fabricant retenu (copie éditable). */
+export interface Ba13Config {
+  system: SystemProfile;
 }
 
-export interface CalcResult {
+/** Résultat purement géométrique, indépendant de tout système constructif. */
+export interface Geometry {
   grossArea: number;
   openingArea: number;
   netArea: number;
+  faces: number;
+  layers: number;
   boardArea: number;
-  lines: MaterialLine[];
-  warnings: string[];
+  studCount: number;
+  railRunMl: number;
+  railRuns: number;
+  openingCount: number;
+  openingLintelMl: number;
+  openingJambMl: number;
 }
 
 export type PriceMap = Record<string, number>;
